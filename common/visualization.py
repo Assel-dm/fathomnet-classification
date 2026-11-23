@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import ast
+import os
+import warnings
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -103,6 +106,8 @@ def plot_distance_histogram(run_dir, split, label):
 def plot_per_class(run_dir, split, label):
     """Print worst F1 and confusion per class"""
     table = pd.read_csv(run_dir / f"per_class_{split}.csv", dtype={"species": str})
+    if "species" not in table and "taxon" in table:
+        table = table.rename(columns={"taxon": "species"})
     worst = table.sort_values("f1").head(25)
     fig, ax = plt.subplots(figsize=(9, max(4, len(worst) * .26)))
     labels = worst["species"]
@@ -113,7 +118,7 @@ def plot_per_class(run_dir, split, label):
     ax.set(xlabel="F1", xlim=(0, 1), title=f"{label} - {split} - lowest F1")
     ax.grid(axis="x", alpha=.2)
     save_figure(fig, run_dir / "figures" / f"per_class_{split}.png")
-    if len(table) <= 40:
+    if len(table) <= 40 and (run_dir / f"confusion_{split}.csv").is_file():
         matrix = pd.read_csv(run_dir / f"confusion_{split}.csv", index_col=0)
         fig, ax = plt.subplots(figsize=(9, 8))
         image = ax.imshow(matrix.to_numpy(), cmap="Blues")
@@ -297,7 +302,7 @@ def draw_tradeoff(ax, table, metric):
         )
 
 
-def build_html(records, overall, seed_summary, output_path):
+def build_html(records, overall, seed_summary, output_path, confusion_splits=()):
     """Build HTML report with Plotly"""
     import base64
     from html import escape
@@ -354,6 +359,11 @@ def build_html(records, overall, seed_summary, output_path):
                 reports_dir / f"comparison_{split}.png",
                 "Top-1 error versus mistake severity",
             ))
+            if split in confusion_splits:
+                parts.append(picture(
+                    reports_dir / f"confusion_by_distance_{split}.png",
+                    "Top-1 confusion by hierarchical distance",
+                ))
             for k in (1, 5, 20):
                 parts.append(picture(
                     reports_dir / f"avg_hierarchical_distance_{k}_{split}.png",
@@ -484,8 +494,327 @@ def build_html(records, overall, seed_summary, output_path):
         encoding="utf-8",
     )
 
+def confusion_distance_reference(campaign_dir, fgvc_taxonomy=None):
+    """Rebuild the evaluation distances from a campaign's saved taxa."""
+    campaign_path = campaign_dir / "campaign.json"
+    campaign = (
+        json.loads(campaign_path.read_text(encoding="utf-8-sig"))
+        if campaign_path.is_file() else {}
+    )
+    taxonomy = campaign.get("taxonomy", [])
+    dataset = str(campaign.get("dataset", "")).lower()
 
-def build_reports(campaign_dir):
+    if "fathom" in dataset or "fgvc" in dataset or (not dataset and fgvc_taxonomy):
+        if fgvc_taxonomy:
+            source = Path(fgvc_taxonomy).expanduser()
+        else:
+            runtime_path = campaign_dir / "runtime.json"
+            runtime = (
+                json.loads(runtime_path.read_text(encoding="utf-8-sig"))
+                if runtime_path.is_file() else {}
+            )
+            roots = [campaign_dir, Path(__file__).resolve().parents[1]]
+            if runtime.get("dataset_root"):
+                roots.insert(1, Path(runtime["dataset_root"]).expanduser())
+
+            filename = "taxonomy_fathomnet2025.json"
+            source = next(
+                (
+                    path
+                    for root in roots
+                    for path in (root / filename, root / "metadata" / filename)
+                    if path.is_file()
+                ),
+                None,
+            )
+            if source is None:
+                raise ValueError(
+                    "FGVC original taxonomy unavailable. "
+                    "Set FATHOMNET_EVALUATION_TAXONOMY to its JSON path."
+                )
+
+        original = json.loads(source.read_text(encoding="utf-8-sig"))
+        if "training_tree" in original or "nodes" not in original or "classes" not in original:
+            raise ValueError("FGVC evaluation requires the original nodes/classes taxonomy JSON.")
+
+        nodes = {node["id"]: node["parent"] for node in original["nodes"]}
+        entries = sorted(original["classes"], key=lambda value: value["class_id"])
+        if [entry["class_id"] for entry in entries] != list(range(len(entries))):
+            raise ValueError("FGVC class IDs must be contiguous and zero-based.")
+
+        lineages, names = [], []
+        for entry in entries:
+            names.append(entry["name"])
+            path, node = [], entry["node_id"]
+            while node is not None:
+                if node in path or node not in nodes:
+                    raise ValueError(f"Invalid FGVC parent chain for {entry['name']}.")
+                path.append(node)
+                node = nodes[node]
+            lineages.append(path[::-1])
+
+        if len(set(names)) != len(names):
+            raise ValueError("FGVC class names must be unique.")
+        if not lineages or len({path[0] for path in lineages}) != 1:
+            raise ValueError("FGVC classes must share a single root.")
+
+        distances = np.zeros((len(names), len(names)), dtype=int)
+        for i, left in enumerate(lineages):
+            for j, right in enumerate(lineages[:i]):
+                shared = next(
+                    (k for k, pair in enumerate(zip(left, right)) if pair[0] != pair[1]),
+                    min(len(left), len(right)),
+                )
+                distances[i, j] = distances[j, i] = len(left) + len(right) - 2 * shared
+
+        return names, distances, "Original FGVC taxonomy (edge count)"
+
+    ranks = ("kingdom", "phylum", "class", "order", "family", "genus", "species")
+    lineage_table = pd.DataFrame(taxonomy)
+    configured_ranks = campaign.get("taxonomy_ranks") or campaign.get("ranks")
+    config_path = campaign_dir / "config_used.py"
+
+    if not configured_ranks and dataset.startswith(("inat21", "inaturalist21")) and config_path.is_file():
+        # Read the archived rank list without executing the configuration.
+        for statement in ast.parse(config_path.read_text(encoding="utf-8-sig")).body:
+            if isinstance(statement, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "INAT21_RANKS"
+                for target in statement.targets
+            ):
+                configured_ranks = ast.literal_eval(statement.value)
+
+    ranks = list(configured_ranks or [rank for rank in ranks if rank in lineage_table])
+    if (
+        lineage_table.empty
+        or len(ranks) < 2
+        or ranks[-1] != "species"
+        or not set(ranks) <= set(lineage_table)
+    ):
+        raise ValueError("Saved campaign taxonomy with rank columns is required.")
+
+    if lineage_table[ranks].isna().any().any() or lineage_table.species.duplicated().any():
+        raise ValueError("Incomplete or duplicate class lineages in campaign.json.")
+
+    names = lineage_table.species.astype(str).tolist()
+    # Same LCA height convention as common.data.build_hierarchy.
+    distances = np.full((len(names), len(names)), len(ranks), dtype=np.uint8)
+    for depth, rank in enumerate(ranks, start=1):
+        ancestors = pd.factorize(lineage_table[rank])[0]
+        distances[ancestors[:, None] == ancestors[None, :]] = len(ranks) - depth
+
+    return names, distances, "Saved campaign taxonomy (LCA height)"
+
+
+def read_confusion_counts(run_dir, split, names):
+    """Load top-1 counts or rebuild them from saved per-crop predictions."""
+    path = run_dir / f"confusion_{split}.csv"
+    if path.is_file():
+        raw = pd.read_csv(path, dtype=str, keep_default_na=False)
+        matrix = raw.set_index(raw.columns[0])
+        if (
+            matrix.index.has_duplicates
+            or matrix.columns.has_duplicates
+            or set(matrix.index) != set(names)
+            or set(matrix.columns) != set(names)
+        ):
+            raise ValueError(f"Class labels do not match the reference taxonomy in {path.name}.")
+
+        values = matrix.loc[names, names].to_numpy(dtype=float)
+        if (
+            not np.isfinite(values).all()
+            or (values < 0).any()
+            or (values != np.floor(values)).any()
+        ):
+            raise ValueError(f"{path.name} must contain raw non-negative confusion counts.")
+        return values.astype(np.int64)
+
+    path = run_dir / f"predictions_{split}.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing confusion_{split}.csv and {path.name}.")
+
+    predictions = pd.read_csv(path, dtype=str, keep_default_na=False)
+    positions = {name: index for index, name in enumerate(names)}
+
+    if {"true_species", "predicted_species"} <= set(predictions):
+        indices = [
+            predictions[column].map(positions)
+            for column in ("true_species", "predicted_species")
+        ]
+        if any(index.isna().any() for index in indices):
+            raise ValueError(f"Unknown class names in {path.name}.")
+    elif {"true_id", "predicted_id"} <= set(predictions):
+        indices = [
+            predictions[column].astype(int)
+            for column in ("true_id", "predicted_id")
+        ]
+        if any(((index < 0) | (index >= len(names))).any() for index in indices):
+            raise ValueError(f"Unknown class IDs in {path.name}.")
+    else:
+        raise ValueError(f"Missing class columns in {path.name}.")
+
+    counts = np.zeros((len(names), len(names)), dtype=np.int64)
+    np.add.at(counts, tuple(index.to_numpy(dtype=int) for index in indices), 1)
+    return counts
+
+
+def confusion_by_distance(counts, distances):
+    """Compute top-1 error shares and mean directional confusion rates."""
+    support = counts.sum(axis=1)
+    if not support.sum():
+        raise ValueError("Cannot plot a split with no evaluated crops.")
+
+    bins = int(distances.max()) + 1
+    errors = np.zeros(bins)
+    rates = np.zeros(bins)
+    pairs = np.zeros(bins, dtype=int)
+
+    for i in np.flatnonzero(support):
+        row = distances[i]
+        per_distance = np.bincount(row, weights=counts[i], minlength=bins)
+        n_pairs = np.bincount(row, minlength=bins)
+
+        # Remove the diagonal, which contains correct predictions.
+        per_distance[row[i]] -= counts[i, i]
+        n_pairs[row[i]] -= 1
+
+        errors += per_distance
+        rates += per_distance / support[i]
+        pairs += n_pairs
+
+    shares = errors / errors.sum() if errors.sum() else np.full(bins, np.nan)
+    averages = np.divide(rates, pairs, out=np.full(bins, np.nan), where=pairs > 0)
+    return shares, averages, pairs, counts.trace() / support.sum()
+
+
+def plot_campaign_confusion_distances(
+    campaign_dir, records, overall, output_dir, compare_campaigns=(),
+):
+    """Compare evaluated variants, averaging available seeds within each variant."""
+    if overall.empty:
+        return set()
+
+    fgvc_override = os.environ.get("FATHOMNET_EVALUATION_TAXONOMY")
+    try:
+        names, distances, reference = confusion_distance_reference(campaign_dir, fgvc_override)
+    except (OSError, ValueError, KeyError, TypeError, SyntaxError) as error:
+        warnings.warn(
+            f"Skipping confusion by distance for {campaign_dir.name}: {error}",
+            stacklevel=2,
+        )
+        return set()
+
+    candidates = [(campaign_dir, records)]
+    for extra in compare_campaigns:
+        other = Path(extra).expanduser()
+        try:
+            other_names, other_distances, other_reference = confusion_distance_reference(
+                other, fgvc_override
+            )
+            if (
+                other_names != names
+                or other_reference != reference
+                or not np.array_equal(other_distances, distances)
+            ):
+                raise ValueError("Class order or evaluation distances differ.")
+
+            other_records = []
+            for path in sorted((other / "runs").glob("*/*/metadata.json")):
+                other_records.append({
+                    "run_dir": path.parent,
+                    "label": run_label(json.loads(path.read_text(encoding="utf-8-sig"))),
+                })
+            candidates.append((other, other_records))
+        except (OSError, ValueError, KeyError, TypeError, SyntaxError) as error:
+            warnings.warn(
+                f"Skipping campaign {other} in confusion by distance: {error}",
+                stacklevel=2,
+            )
+
+    plotted_splits = set()
+    for split in overall["split"].unique():
+        curves = {}
+        reference_support = None
+
+        for folder, record in ((folder, record) for folder, runs in candidates for record in runs):
+            run_dir = record["run_dir"]
+            if not (run_dir / f"metrics_{split}.json").is_file():
+                continue
+
+            try:
+                counts = read_confusion_counts(run_dir, split, names)
+                support = counts.sum(axis=1)
+                if reference_support is not None and not np.array_equal(support, reference_support):
+                    raise ValueError("Class supports differ from the other runs on this split.")
+                stats = confusion_by_distance(counts, distances)
+            except (OSError, ValueError, TypeError) as error:
+                warnings.warn(
+                    f"Skipping confusion by distance in {run_dir} ({split}): {error}",
+                    stacklevel=2,
+                )
+                continue
+
+            reference_support = support
+            label = record["label"].rsplit(" - seed ", 1)[0]
+            if len(candidates) > 1:
+                label = f"{folder.name} | {label}"
+            curves.setdefault(label, []).append(stats)
+
+        if not curves:
+            continue
+
+        pairs = next(iter(curves.values()))[0][2]
+        x = np.flatnonzero(pairs)
+        if not x.size:
+            continue
+
+        fig, (left, right) = plt.subplots(1, 2, figsize=(12, 5))
+        for label, stats in curves.items():
+            shares = [item[0] for item in stats if np.isfinite(item[0]).any()]
+            average = np.mean([item[1][x] for item in stats], axis=0)
+            accuracy = np.mean([item[3] for item in stats])
+            shown_label = f"{label} | top-1 {accuracy:.1%}"
+            line = right.plot(x, average, marker="o", markersize=3, label=shown_label)[0]
+
+            if shares:
+                left.plot(
+                    x, np.mean(shares, axis=0)[x],
+                    marker="o", markersize=3, color=line.get_color(),
+                )
+
+        left.set(
+            title="Distribution of top-1 errors",
+            xlabel="Hierarchical distance",
+            ylabel="Share of all errors",
+        )
+        right.set(
+            title="Mean confusion by ordered class pair",
+            xlabel="Distance (eligible ordered pairs)",
+            ylabel="Mean share of crops from the true class",
+        )
+        left.set_xticks(x)
+        right.set_xticks(x, [f"{d}\n({pairs[d]})" for d in x], fontsize=8)
+
+        for axis in (left, right):
+            axis.yaxis.set_major_formatter(PercentFormatter(xmax=1))
+            axis.set_ylim(bottom=0)
+            axis.grid(axis="y", alpha=.25)
+
+        if not left.lines:
+            left.text(.5, .5, "No top-1 errors", transform=left.transAxes, ha="center")
+
+        fig.suptitle(f"Confusion by hierarchical distance | {split}\n{reference}")
+        handles, labels = right.get_legend_handles_labels()
+        fig.legend(
+            handles, labels, loc="upper center", bbox_to_anchor=(.5, -.025),
+            ncol=min(3, len(labels)), frameon=False, fontsize=8,
+        )
+        fig.tight_layout(rect=(0, 0, 1, .93))
+        save_figure(fig, output_dir / f"confusion_by_distance_{split}.png")
+        plotted_splits.add(split)
+
+    return plotted_splits
+
+def build_reports(campaign_dir, compare_campaigns=()):
     """Build graphics with available with available plots"""
     campaign_dir = Path(campaign_dir).expanduser()
     if not campaign_dir.is_dir():
@@ -527,8 +856,11 @@ def build_reports(campaign_dir):
                    if key != "training"},
                 "label": label, "split": split, **scores,
             })
+            per_class_path = run_dir / f"per_class_{split}.csv"
+            if not per_class_path.is_file():
+                continue
             record["classes"][split] = pd.read_csv(
-                run_dir / f"per_class_{split}.csv",
+                per_class_path,
                 dtype={"species": str},
             )
             table = record["classes"][split].copy()
@@ -600,13 +932,21 @@ def build_reports(campaign_dir):
                 )
 
     summary.to_csv(reports_dir / "seed_summary.csv", index=False)
+    confusion_splits = plot_campaign_confusion_distances(
+        campaign_dir, records, overall, reports_dir, compare_campaigns
+    )
     plot_dataset_counts(reports_dir / "dataset_counts.csv", reports_dir)
-    build_html(records, overall, summary, reports_dir / "report.html")
+    build_html(records, overall, summary, reports_dir / "report.html", confusion_splits)
     print("Report:", reports_dir / "report.html")
     return overall
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("campaign_dir", type=Path, help="File containing runs/ and campaign.json")
-    build_reports(parser.parse_args().campaign_dir)
+    parser.add_argument("campaign_dir", type=Path, help="Folder containing runs/ and campaign.json")
+    parser.add_argument(
+        "--compare", type=Path, nargs="+", default=(),
+        help="Additional campaigns for the confusion-by-distance figure",
+    )
+    args = parser.parse_args()
+    build_reports(args.campaign_dir, args.compare)
