@@ -14,6 +14,7 @@ from common.visualization import build_reports, plot_augmentation_preview
 from common.data import build_loaders
 from datasets.small_collemboles import load_small_collemboles
 from datasets.inaturalist19 import load_inaturalist19, show_summary
+from datasets.fathomnet import load_fathomnet
 from methods.mbm import build_loss, soft_label_statistics
 from methods.haf import HAFClassifier, build_loss as build_haf_loss
 
@@ -66,6 +67,12 @@ def main():
             check_files=getattr(cfg, "INAT21_CHECK_FILES", True),
         )
         show_inat21_summary(data)
+    elif cfg.DATASET == "fathomnet":
+        data = load_fathomnet(
+            cfg.DATASET_ROOT,
+            taxonomy_adapted=cfg.FATHOMNET_TAXONOMY_ADAPTED,
+            taxonomy_original=cfg.FATHOMNET_TAXONOMY_ORIGINAL,
+        )
     else:
         raise NotImplementedError(f"Dataset to be added main.py : {cfg.DATASET}")
 
@@ -130,7 +137,17 @@ def main():
             dataset_info=data["dataset_info"],
         )
     
+    if data["name"] == "fathomnet":
+        campaign_config["fathomnet_taxonomies"] = data["fathomnet_taxonomy_fingerprints"]
+        campaign_config["taxonomy_ranks"] = data["ranks"]
+
     check_configuration(campaign_dir / "campaign.json", campaign_config)
+
+    if data["name"] == "fathomnet":
+        check_configuration(
+            campaign_dir / "taxonomy_fathomnet2025.json",
+            data["fathomnet_original_taxonomy"],
+        )
     save_json(campaign_dir / "runtime.json", {"dataset_root": str(data["root"]), "device": str(device),
                                             "num_workers": cfg.NUM_WORKERS})
     reports_dir = campaign_dir / "reports"
