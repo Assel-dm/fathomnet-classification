@@ -32,21 +32,46 @@ def compute_metrics(targets, probabilities, data):
     scores = {"top1_accuracy": float((~mistakes).mean()), "top1_error": float(mistakes.mean()),
               "species_accuracy": float((~mistakes).mean()),
               "mistake_severity": float(distances[mistakes].mean()) if mistakes.any() else 0.}
+    adapted = data.get("distance_matrix_adapted")
+    if adapted is not None:
+        adapted_errors = adapted[targets[mistakes], predictions[mistakes]]
+        scores["mistake_severity_adapted"] = (
+            float(adapted_errors.mean()) if adapted_errors.size else 0.0
+        )
     ranking = np.argsort(probabilities, axis=1)[:, ::-1]
     for k in (1, 5, 20):
         top = predictions[:, None] if k == 1 else ranking[:, :min(k, n_classes)]
         scores[f"top{k}_accuracy"] = float((top == targets[:, None]).any(axis=1).mean())
         scores[f"avg_hierarchical_distance@{k}"] = float(data["distance_matrix"][targets[:, None], top].mean())
+        if adapted is not None:
+            scores[f"avg_hierarchical_distance@{k}_adapted"] = float(
+                adapted[targets[:, None], top].mean()
+            )
     for average in ("macro", "weighted"):
         p, r, f, _ = precision_recall_fscore_support(targets, predictions, labels=np.arange(n_classes), average=average, zero_division=0)
         scores.update({f"precision_{average}": float(p), f"recall_{average}": float(r), f"f1_{average}": float(f)})
-    for rank, mapping in data["mappings"].items():
-        true_ancestors = mapping[targets].argmax(axis=1)
-        predicted_ancestors = (probabilities @ mapping).argmax(axis=1)
-        scores[f"{rank}_accuracy"] = float((true_ancestors == predicted_ancestors).mean())
+    rank_mappings = data.get("evaluation_mappings", data["mappings"])
+    rank_known = data.get("evaluation_rank_known", {})
+
+    for rank, mapping in rank_mappings.items():
+        eligible = rank_known[rank][targets] if rank in rank_known else slice(None)
+        true_ancestors = mapping[targets[eligible]].argmax(axis=1)
+
+        if rank in rank_known:
+            scores[f"{rank}_support"] = int(true_ancestors.size)
+        if not true_ancestors.size:
+            continue
+
+        predicted_ancestors = (probabilities[eligible] @ mapping).argmax(axis=1)
+        top1_ancestors = mapping[predictions[eligible]].argmax(axis=1)
+
+        scores[f"{rank}_accuracy"] = float(
+            (true_ancestors == predicted_ancestors).mean()
+        )
         scores[f"{rank}_accuracy_probability_sum"] = scores[f"{rank}_accuracy"]
-        top1_ancestors = mapping[predictions].argmax(axis=1)
-        scores[f"{rank}_accuracy_top1_ancestor"] = float((true_ancestors == top1_ancestors).mean())
+        scores[f"{rank}_accuracy_top1_ancestor"] = float(
+            (true_ancestors == top1_ancestors).mean()
+        )
     return scores
 
 
@@ -80,6 +105,10 @@ def evaluate_model(model, loader, device, data, run_dir, split, save_probabiliti
         rows[f"avg_hierarchical_distance@{k}"] = data["distance_matrix"][targets[:, None], top].mean(axis=1)
         if k > 1:
             rows[f"top{k}_predicted_ids"] = [json.dumps(ids.tolist()) for ids in top]
+    if "distance_matrix_adapted" in data:
+        rows["taxonomic_distance_adapted"] = data["distance_matrix_adapted"][
+            targets, predictions
+        ]
     rows.to_csv(run_dir / f"predictions_{split}.csv", index=False)
 
     distances = rows["taxonomic_distance"].to_numpy()
